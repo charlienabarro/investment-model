@@ -133,5 +133,9 @@ def get_sector(ticker: str) -> str:
     if grp in ("bonds", "gold", "metals", "commodities", "energy", "agriculture"):
         return grp
     if grp == "us_equity":
-        return "equity_etf"
+        return "equity_etf"  # separate sector so ETFs don't compete with stock sector caps
     return "other"
+
+# Index ETFs that should be eligible for equity selection
+# These act as a stable core — lower vol than individual stocks
+INDEX_ETFS = {"spy.us", "qqq.us", "dia.us", "iwm.us", "vti.us", "voo.us"}

@@ -761,7 +761,13 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
             cov_shrink=0.15,
         )
 
-        weights = res.weights.sort_values(ascending=False)
+        # 3) final renorm (safety)
+        weights = weights / float(weights.sum())
+
+        # Drop positions below minimum weight
+        weights = weights[weights >= MIN_WEIGHT - 1e-6]
+        if weights.empty:
+            continue
         weights = weights / float(weights.sum())
 
         # ── Extra risk caps (NEW) ─────────────────────────────

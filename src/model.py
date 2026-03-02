@@ -7,7 +7,7 @@ from typing import Dict, List, Tuple
 import numpy as np
 import pandas as pd
 from .news_sentiment import update_news_sentiment
-
+from .optimiser import optimise_long_only
 from .config import (
     EQUITY_K, BONDS_K, COMMS_K, TOTAL_K,
     MAX_WEIGHT, MIN_WEIGHT,
@@ -49,6 +49,24 @@ WF_EVAL_MONTHS = 3         # look at last 3 live months to measure recent accura
 ML_CONFIDENCE_FLOOR = 0.30 # never trust ML less than 30% (always blend some ML in)
 ML_CONFIDENCE_CAP = 0.85   # never trust ML more than 85% (always blend some fallback)
 
+# --- extra risk caps (new) ---
+MAX_STOCK_WEIGHT = 0.12      # cap single-name stocks
+MAX_ETF_WEIGHT   = 0.18      # allow bigger ETFs (SHY/IEF/QQQ etc)
+MAX_SLV_WEIGHT   = 0.10      # cap silver ETF
+SEMIS_MAX_NAMES  = 2         # max 2 semi/storage names
+SEMIS_MAX_TOTAL  = 0.25      # max 25% total weight in semi/storage bucket
+
+SEMIS_STORAGE = {
+    "mu.us","wdc.us","stx.us","asml.us","intc.us","nvda.us","amd.us",
+    "lrcx.us","klac.us","amat.us","txn.us","qcom.us","avgo.us","mrvl.us"
+}
+
+KNOWN_ETFS = {
+    "spy.us","qqq.us","dia.us","iwm.us","vti.us","voo.us",
+    "ief.us","tlt.us","shy.us","lqd.us","hyg.us",
+    "gld.us","iau.us","slv.us",
+    "dbc.us","pdbc.us","djp.us","uso.us","ung.us","dba.us","cper.us","copx.us",
+}
 
 # ═══════════════════════════════════════════════════════════
 # Helpers
@@ -499,7 +517,73 @@ def _apply_hysteresis(candidates: pd.DataFrame, prev_holdings: set, boost: float
     out.loc[is_held, "score"] = out.loc[is_held, "score"] + boost
     return out
 
+def _is_etf(t: str) -> bool:
+    t = (t or "").lower()
+    if t in KNOWN_ETFS:
+        return True
+    g = _group_of(t)
+    return g in {"bonds", "gold", "metals", "commodities", "energy", "agriculture"}
 
+def _cap_redistribute(w: pd.Series, caps: pd.Series) -> pd.Series:
+    """
+    Cap weights at caps[ticker] and redistribute excess pro-rata to those under cap.
+    Assumes w sums to 1.
+    """
+    w = w.copy().astype(float)
+    caps = caps.reindex(w.index).astype(float)
+
+    for _ in range(50):
+        over = w > caps + 1e-12
+        if not over.any():
+            break
+
+        excess = float((w[over] - caps[over]).sum())
+        w[over] = caps[over]
+
+        under = w < caps - 1e-12
+        room = (caps[under] - w[under]).clip(lower=0.0)
+        room_sum = float(room.sum())
+
+        if excess <= 0 or room_sum <= 1e-12:
+            break
+
+        w[under] = w[under] + room / room_sum * excess
+
+    # final renorm (numerical safety)
+    s = float(w.sum())
+    return w / s if s > 0 else w
+
+def _enforce_semis_name_cap(selected: List[str], candidates: pd.DataFrame) -> List[str]:
+    """
+    Keep at most SEMIS_MAX_NAMES from SEMIS_STORAGE.
+    Fill removed slots with next best non-semis candidates.
+    """
+    out = []
+    semis = 0
+    for t in selected:
+        if t in SEMIS_STORAGE:
+            if semis >= SEMIS_MAX_NAMES:
+                continue
+            semis += 1
+        out.append(t)
+
+    need = len(selected) - len(out)
+    if need <= 0:
+        return out
+
+    # fill from candidates by score, avoiding already selected + avoiding semis overflow
+    for t in candidates.sort_values("score", ascending=False)["ticker"].tolist():
+        if t in out:
+            continue
+        if t in SEMIS_STORAGE and semis >= SEMIS_MAX_NAMES:
+            continue
+        if t in SEMIS_STORAGE:
+            semis += 1
+        out.append(t)
+        if len(out) >= len(selected):
+            break
+
+    return out
 # ═══════════════════════════════════════════════════════════
 # Main entry point
 # ═══════════════════════════════════════════════════════════
@@ -605,34 +689,111 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
         eq_selected = _corr_filter_select_with_sector_cap(
             eq, rets, EQUITY_K, CORR_THRESHOLD, MAX_PER_SECTOR
         )
+        eq_selected = _enforce_semis_name_cap(eq_selected, eq)
         bd_selected = bd["ticker"].tolist()[:BONDS_K]
         cm_selected = cm["ticker"].tolist()[:COMMS_K]
 
         # ── Weight construction ──
-        weights = pd.Series(dtype=float)
+        # ── Weight construction (NEW: optimiser) ──
 
-        eq_rows = snap[snap["ticker"].isin(eq_selected)].set_index("ticker")
-        if not eq_rows.empty:
-            w_eq = _weights_with_caps(eq_rows["score"], eq_rows.get("vol_63", pd.Series(0.02, index=eq_rows.index)), budgets["equity"])
-            weights = pd.concat([weights, w_eq])
+        selected = list(eq_selected) + list(bd_selected) + list(cm_selected)
+        selected = [t.lower() for t in selected]
+        selected = list(dict.fromkeys(selected))[:TOTAL_K]
 
-        bd_rows = snap[snap["ticker"].isin(bd_selected)].set_index("ticker")
-        if not bd_rows.empty:
-            w_bd = _weights_with_caps(bd_rows["score"], bd_rows.get("vol_63", pd.Series(0.01, index=bd_rows.index)), budgets["bonds"])
-            weights = pd.concat([weights, w_bd])
+        # Expected returns from the model score
+        # Keep it simple: treat score as a return ranking proxy
+        mu = snap.set_index("ticker").reindex(selected)["score"].astype(float).fillna(0.0)
 
-        cm_rows = snap[snap["ticker"].isin(cm_selected)].set_index("ticker")
-        if not cm_rows.empty:
-            w_cm = _weights_with_caps(cm_rows["score"], cm_rows.get("vol_63", pd.Series(0.02, index=cm_rows.index)), budgets["commodities"])
-            weights = pd.concat([weights, w_cm])
+        # Daily returns matrix for risk model
+        if prices_for_corr.empty:
+            rets = pd.DataFrame()
+        else:
+            rets = _trailing_returns_pivot(prices_for_corr, end_date, CORR_WINDOW_DAYS)
 
-        weights = weights.groupby(weights.index).sum()
-        weights = _normalize(weights)
-        weights = weights.clip(upper=MAX_WEIGHT).clip(lower=MIN_WEIGHT)
+        # Caps per ticker
+        caps = pd.Series(
+            {t: (MAX_ETF_WEIGHT if _is_etf(t) else MAX_STOCK_WEIGHT) for t in selected},
+            index=selected,
+            dtype=float,
+        )
+        if "slv.us" in caps.index:
+            caps["slv.us"] = min(caps["slv.us"], MAX_SLV_WEIGHT)
+
+        # Sector caps, convert "max per sector" into a weight cap
+        # Simple default: no sector above 35%, you can tune this later
+        sector_caps = {}
+        for t in selected:
+            sec = get_sector(t)
+            if sec not in sector_caps:
+                sector_caps[sec] = 0.35
+
+        sector_map = {t: get_sector(t) for t in selected}
+
+        # Group caps
+        group_caps = {
+            "semis_storage": (SEMIS_STORAGE, SEMIS_MAX_TOTAL),
+        }
+
+        # Previous weights for turnover penalty
+        prev_w = pd.Series(0.0, index=selected)
+        if prev_month_holdings:
+            # equal weight previous holdings as a proxy, you can store actual prev weights later
+            prev_list = [t for t in selected if t in prev_month_holdings]
+            if prev_list:
+                prev_w.loc[prev_list] = 1.0 / len(prev_list)
+
+        # Min weight, keep your 3% floor
+        min_w = float(MIN_WEIGHT)
+
+        res = optimise_long_only(
+            tickers=selected,
+            mu=mu,
+            returns=rets,
+            caps=caps,
+            min_w=float(MIN_WEIGHT),
+            sector_map=sector_map,
+            sector_caps=sector_caps,
+            group_caps=group_caps,
+            prev_w=prev_w,
+            risk_aversion=10.0,
+            turnover_penalty=0.6,
+            l2_penalty=0.05,
+            cov_shrink=0.15,
+        )
+
+        weights = res.weights.sort_values(ascending=False)
         weights = weights / float(weights.sum())
-        weights = weights.sort_values(ascending=False).head(TOTAL_K)
-        weights = weights / float(weights.sum())
 
+        # ── Extra risk caps (NEW) ─────────────────────────────
+        # 1) cap by instrument type (stock vs ETF) + special cap for SLV
+        caps = pd.Series(
+            {t: (MAX_ETF_WEIGHT if _is_etf(t) else MAX_STOCK_WEIGHT) for t in weights.index},
+            index=weights.index,
+            dtype=float,
+        )
+        if "slv.us" in caps.index:
+            caps["slv.us"] = min(caps["slv.us"], MAX_SLV_WEIGHT)
+
+        weights = _cap_redistribute(weights, caps)
+
+        # 2) cap total semi/storage exposure
+        semis_names = [t for t in weights.index if t in SEMIS_STORAGE]
+        if semis_names:
+            semis_total = float(weights.loc[semis_names].sum())
+            if semis_total > SEMIS_MAX_TOTAL + 1e-12:
+                # shrink semis to the cap
+                shrink = SEMIS_MAX_TOTAL / semis_total
+                weights.loc[semis_names] *= shrink
+
+                # redistribute removed weight to non-semis (pro-rata), then re-cap
+                non = [t for t in weights.index if t not in SEMIS_STORAGE]
+                if non:
+                    weights.loc[non] *= (1.0 / float(weights.loc[non].sum())) * (1.0 - float(weights.loc[semis_names].sum()))
+
+                weights = _cap_redistribute(weights / float(weights.sum()), caps)
+
+        # 3) final renorm (safety)
+        weights = weights / float(weights.sum())
         # ── Build output ──
         vol_scale = _vol_scale_factor(snap)
         dd_shift = _drawdown_tilt(snap)

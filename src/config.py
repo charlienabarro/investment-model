@@ -9,10 +9,10 @@ REBALANCE_FREQ = "M"
 
 # ── Portfolio construction ─────────────────────────────────
 # 8 holdings max: 6 equity, 1 bond ETF, 1 commodity ETF
-EQUITY_K = 6
-BONDS_K = 1
-COMMS_K = 1
-TOTAL_K = EQUITY_K + BONDS_K + COMMS_K  # 8
+EQUITY_K = 8
+BONDS_K = 2
+COMMS_K = 2
+TOTAL_K = EQUITY_K + BONDS_K + COMMS_K
 
 MAX_WEIGHT = 0.20        # 20% cap per name (8 names → room for concentration)
 MIN_WEIGHT = 0.05        # 5% floor (£17.50 on £350 — above T212 min)

@@ -1,32 +1,83 @@
+# src/stooq_data.py
+from __future__ import annotations
+
 import io
+import time
+from typing import Optional
+
 import pandas as pd
 import requests
-import certifi
 
-def fetch_stooq_daily(ticker: str) -> pd.DataFrame:
-    url = f"https://stooq.com/q/d/l/?s={ticker.lower()}&i=d"
 
-    r = requests.get(url, timeout=30, verify=certifi.where())
-    r.raise_for_status()
+_BASE = "https://stooq.com/q/d/l/"
 
-    df = pd.read_csv(io.StringIO(r.text))
 
-    if df.empty:
-        return df
+def _looks_like_no_data(text: str) -> bool:
+    t = (text or "").strip().lower()
+    if not t:
+        return True
+    if "no data" in t[:200]:
+        return True
+    return False
 
-    df = df.rename(columns={
-        "Date": "date",
-        "Open": "open",
-        "High": "high",
-        "Low": "low",
-        "Close": "close",
-        "Volume": "volume",
-    })
 
-    df["date"] = pd.to_datetime(df["date"], errors="coerce").dt.date.astype(str)
-    for c in ["open", "high", "low", "close", "volume"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+def fetch_stooq_daily(ticker: str, retries: int = 5, timeout: int = 30) -> pd.DataFrame:
+    """
+    Fetch daily OHLCV from Stooq.
 
-    df = df[["date", "open", "high", "low", "close", "volume"]].dropna(subset=["date", "close"])
-    return df.sort_values("date").reset_index(drop=True)
+    Returns columns: date, open, high, low, close, volume
+    Empty DF means no data.
+    """
+    sym = (ticker or "").strip().lower()
+    if not sym:
+        return pd.DataFrame()
+
+    params = {"s": sym, "i": "d"}
+
+    last_err: Optional[Exception] = None
+    for attempt in range(retries):
+        try:
+            r = requests.get(_BASE, params=params, timeout=timeout, headers={"User-Agent": "investing-model/1.0"})
+            if r.status_code != 200:
+                time.sleep(1.0 + attempt * 0.75)
+                continue
+
+            if _looks_like_no_data(r.text):
+                return pd.DataFrame()
+
+            df = pd.read_csv(io.StringIO(r.text))
+            if df.empty:
+                return pd.DataFrame()
+
+            # Stooq format is typically: Date,Open,High,Low,Close,Volume
+            cols = [c.strip().lower() for c in df.columns]
+            df.columns = cols
+
+            if "date" not in df.columns:
+                # Sometimes "Date" becomes first unnamed column in odd responses
+                return pd.DataFrame()
+
+            keep = ["date", "open", "high", "low", "close", "volume"]
+            for c in keep:
+                if c not in df.columns:
+                    df[c] = pd.NA
+
+            out = df[keep].copy()
+            out["date"] = pd.to_datetime(out["date"], errors="coerce")
+            out = out.dropna(subset=["date"])
+            out = out.sort_values("date").reset_index(drop=True)
+
+            for c in ["open", "high", "low", "close", "volume"]:
+                out[c] = pd.to_numeric(out[c], errors="coerce")
+
+            if out.empty:
+                return pd.DataFrame()
+
+            return out
+
+        except Exception as e:
+            last_err = e
+            time.sleep(1.0 + attempt * 0.75)
+
+    # Final fallback: fail closed
+    return pd.DataFrame()

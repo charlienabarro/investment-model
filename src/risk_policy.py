@@ -1,7 +1,11 @@
-# src/risk_policy.py — V2: added GICS-like sector mapping + sector caps
+# src/risk_policy.py
+from __future__ import annotations
+
+# Minimal, robust sector + group mapping.
+# You can expand SECTOR_MAP whenever you add tickers.
 
 GROUP_MAP = {
-    # Core ETFs
+    # Broad equity ETFs
     "spy.us": "us_equity",
     "qqq.us": "us_equity",
     "dia.us": "us_equity",
@@ -9,133 +13,93 @@ GROUP_MAP = {
     "vti.us": "us_equity",
     "voo.us": "us_equity",
 
+    # Bonds / cashlike
+    "shy.us": "bonds",
     "ief.us": "bonds",
     "tlt.us": "bonds",
-    "shy.us": "bonds",
     "lqd.us": "bonds",
     "hyg.us": "bonds",
 
+    # Metals / commodities
     "gld.us": "gold",
     "iau.us": "gold",
     "slv.us": "metals",
-
-    # Commodities
     "dbc.us": "commodities",
     "pdbc.us": "commodities",
     "djp.us": "commodities",
-    "uso.us": "energy",
-    "ung.us": "energy",
-    "dba.us": "agriculture",
-    "cper.us": "metals",
     "copx.us": "metals",
 }
 
-DEFAULT_GROUP = "us_equity"  # individual stocks default to us_equity
+DEFAULT_GROUP = "us_equity"
 
-
-# Hard caps by group (these are safety rails)
-GROUP_CAPS = {
-    "us_equity": 0.75,
-    "em_equity": 0.20,
-    "bonds": 0.80,
-    "commodities": 0.35,
-    "energy": 0.20,
-    "agriculture": 0.20,
-    "gold": 0.30,
-    "metals": 0.25,
-}
-
-
-# ═══════════════════════════════════════════════════════════
-# GICS-like sector mapping for individual stocks
-# ═══════════════════════════════════════════════════════════
-# This maps tickers to broad sectors. Used for:
-# 1. Sector cap (max 2 equity names per sector)
-# 2. Sector-relative features in features.py
-#
-# For tickers not listed here, we try to infer from the name,
-# or default to "other". ETFs get their own sectors.
-
-SECTOR_BY_TICKER = {
-    # ── Technology ──
-    "aapl.us": "tech", "msft.us": "tech", "googl.us": "tech", "goog.us": "tech",
-    "meta.us": "tech", "amzn.us": "tech", "nflx.us": "tech", "crm.us": "tech",
-    "adbe.us": "tech", "orcl.us": "tech", "csco.us": "tech", "intc.us": "tech",
-    "ibm.us": "tech", "now.us": "tech", "uber.us": "tech", "abnb.us": "tech",
-    "snap.us": "tech", "pins.us": "tech", "sq.us": "tech", "shop.us": "tech",
-    "pltr.us": "tech", "net.us": "tech", "ddog.us": "tech", "snow.us": "tech",
-    "crwd.us": "tech", "zs.us": "tech", "panw.us": "tech", "ftnt.us": "tech",
-
-    # ── Semiconductors ──
-    "nvda.us": "semis", "amd.us": "semis", "avgo.us": "semis", "qcom.us": "semis",
-    "txn.us": "semis", "amat.us": "semis", "lrcx.us": "semis", "klac.us": "semis",
-    "mrvl.us": "semis", "nxpi.us": "semis", "on.us": "semis", "adi.us": "semis",
-    "mchp.us": "semis", "mu.us": "semis", "arm.us": "semis", "smci.us": "semis",
-    "asml.us": "semis", "tsm.us": "semis",
-
-    # ── Healthcare ──
-    "unh.us": "health", "jnj.us": "health", "lly.us": "health", "pfe.us": "health",
-    "abbv.us": "health", "mrk.us": "health", "tmo.us": "health", "abt.us": "health",
-    "dhr.us": "health", "bmy.us": "health", "amgn.us": "health", "gild.us": "health",
-    "isrg.us": "health", "vrtx.us": "health", "regn.us": "health", "mdlz.us": "health",
-    "ci.us": "health", "hum.us": "health", "hca.us": "health", "elv.us": "health",
-    "syk.us": "health", "bsx.us": "health", "eog.us": "health",
-
-    # ── Financials ──
-    "jpm.us": "financials", "bac.us": "financials", "wfc.us": "financials",
-    "gs.us": "financials", "ms.us": "financials", "c.us": "financials",
-    "blk.us": "financials", "schw.us": "financials", "spgi.us": "financials",
-    "ice.us": "financials", "cme.us": "financials", "aon.us": "financials",
-    "mmc.us": "financials", "pgr.us": "financials", "met.us": "financials",
-    "aig.us": "financials", "brk.b.us": "financials", "v.us": "financials",
-    "ma.us": "financials", "axp.us": "financials", "pypl.us": "financials",
-
-    # ── Industrials ──
-    "cat.us": "industrials", "de.us": "industrials", "hon.us": "industrials",
-    "ge.us": "industrials", "rtx.us": "industrials", "lmt.us": "industrials",
-    "ba.us": "industrials", "noc.us": "industrials", "gd.us": "industrials",
-    "ups.us": "industrials", "fdx.us": "industrials", "wr.us": "industrials",
-    "etn.us": "industrials", "itt.us": "industrials", "pcar.us": "industrials",
-
-    # ── Consumer / Retail ──
-    "wmt.us": "consumer", "cost.us": "consumer", "hd.us": "consumer",
-    "low.us": "consumer", "tgt.us": "consumer", "ko.us": "consumer",
-    "pep.us": "consumer", "pg.us": "consumer", "cl.us": "consumer",
-    "mnst.us": "consumer", "sbux.us": "consumer", "mcd.us": "consumer",
-    "nike.us": "consumer", "tsla.us": "consumer",
-
-    # ── Energy ──
-    "xom.us": "energy_stock", "cvx.us": "energy_stock", "cop.us": "energy_stock",
-    "slb.us": "energy_stock", "eog.us": "energy_stock", "pxd.us": "energy_stock",
-    "oxy.us": "energy_stock", "vlo.us": "energy_stock", "mpc.us": "energy_stock",
-    "psx.us": "energy_stock", "hal.us": "energy_stock",
-
-    # ── Utilities / REITs ──
-    "nee.us": "utilities", "duk.us": "utilities", "so.us": "utilities",
-    "d.us": "utilities", "aep.us": "utilities", "exc.us": "utilities",
-    "pld.us": "reits", "amt.us": "reits", "cci.us": "reits",
-    "eqr.us": "reits", "o.us": "reits", "spg.us": "reits",
-
-    # ── Storage / Hardware ──
-    "wdc.us": "storage", "stt.us": "storage",
-}
-
-# Max equity names from the same sector
+# Simple sector caps used by correlation filter selection.
 MAX_PER_SECTOR = 2
 
-def get_sector(ticker: str) -> str:
-    """Get the GICS-like sector for a ticker."""
-    t = ticker.lower()
-    if t in SECTOR_BY_TICKER:
-        return SECTOR_BY_TICKER[t]
-    # ETFs and commodities — use their group
-    grp = GROUP_MAP.get(t, DEFAULT_GROUP)
-    if grp in ("bonds", "gold", "metals", "commodities", "energy", "agriculture"):
-        return grp
-    if grp == "us_equity":
-        return "equity_etf"  # separate sector so ETFs don't compete with stock sector caps
-    return "other"
+SECTOR_MAP = {
+    # Semis / hardware
+    "asml.us": "Semiconductors",
+    "nvda.us": "Semiconductors",
+    "amd.us": "Semiconductors",
+    "intc.us": "Semiconductors",
+    "mu.us": "Semiconductors",
+    "wdc.us": "Storage",
+    "stx.us": "Storage",
+    "klac.us": "Semiconductors",
+    "lrcx.us": "Semiconductors",
+    "amat.us": "Semiconductors",
 
-# Index ETFs that should be eligible for equity selection
-# These act as a stable core — lower vol than individual stocks
-INDEX_ETFS = {"spy.us", "qqq.us", "dia.us", "iwm.us", "vti.us", "voo.us"}
+    # Healthcare
+    "jnj.us": "Healthcare",
+    "mrk.us": "Healthcare",
+    "abbv.us": "Healthcare",
+    "pfe.us": "Healthcare",
+
+    # Consumer
+    "pg.us": "Consumer",
+    "wmt.us": "Consumer",
+    "ko.us": "Consumer",
+    "pep.us": "Consumer",
+    "mcd.us": "Consumer",
+
+    # Energy
+    "xom.us": "Energy",
+    "cvx.us": "Energy",
+    "hal.us": "Energy",
+    "slb.us": "Energy",
+    "oxy.us": "Energy",
+
+    # Industrials
+    "cat.us": "Industrials",
+    "fdx.us": "Industrials",
+    "ups.us": "Industrials",
+    "de.us": "Industrials",
+
+    # Tech / software
+    "msft.us": "Software",
+    "aapl.us": "Hardware",
+    "amzn.us": "Internet",
+    "googl.us": "Internet",
+    "meta.us": "Internet",
+    "adbe.us": "Software",
+    "crm.us": "Software",
+    "csco.us": "Networking",
+
+    # Financials
+    "jpm.us": "Financials",
+    "v.us": "Financials",
+    "ma.us": "Financials",
+    "gs.us": "Financials",
+    "ms.us": "Financials",
+}
+
+
+def get_sector(ticker: str) -> str:
+    t = (ticker or "").lower()
+    if t in SECTOR_MAP:
+        return SECTOR_MAP[t]
+    if t in GROUP_MAP:
+        # ETFs grouped as their own "sector" for cap purposes
+        return GROUP_MAP[t]
+    if t == "cash":
+        return "cash"
+    return "Other"

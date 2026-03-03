@@ -1,17 +1,13 @@
 # src/pipeline.py
-from __future__ import annotations
-
 import pandas as pd
-
 from .db import get_conn, init_db, get_last_date_for_ticker
 from .stooq_data import fetch_stooq_daily
-from .features import build_feature_frame, add_cross_sectional_zscores
+from .features import build_feature_frame, add_cross_sectional_zscores, add_sector_relative_features
 from .model import make_monthly_recommendations
 from .universe import get_universe
-from .config import PORTFOLIO_VALUE, BASE_DIR
-
-from .sec_edgar import build_sec_filing_features
-from .news_events import build_news_features
+from .config import PORTFOLIO_VALUE, MIN_TRADE_GBP, NO_TRADE_BAND, MAX_TURNOVER
+from .features_store import upsert_features
+from .news_sentiment import update_news_sentiment
 
 
 def upsert_prices(ticker: str, df: pd.DataFrame) -> int:
@@ -20,10 +16,7 @@ def upsert_prices(ticker: str, df: pd.DataFrame) -> int:
 
     rows = []
     for _, r in df.iterrows():
-        rows.append((
-            r["date"], ticker, r.get("open"), r.get("high"), r.get("low"),
-            r.get("close"), r.get("volume")
-        ))
+        rows.append((r["date"], ticker, r.get("open"), r.get("high"), r.get("low"), r.get("close"), r.get("volume")))
 
     with get_conn() as conn:
         conn.executemany(
@@ -37,35 +30,18 @@ def upsert_prices(ticker: str, df: pd.DataFrame) -> int:
                 close=excluded.close,
                 volume=excluded.volume
             """,
-            rows
+            rows,
         )
     return len(rows)
 
 
 def update_all_prices() -> None:
     universe = get_universe()
-
-    with get_conn() as conn:
-        # quick guard: if we already inserted prices today, don’t refetch everything
-        today = pd.Timestamp.today().date().isoformat()
-        already = pd.read_sql_query(
-            "SELECT COUNT(*) AS n FROM prices_daily WHERE date = ?",
-            conn,
-            params=(today,),
-        )["n"].iloc[0]
-        if already > 0:
-            print(f"[OK] Prices already present for today ({today}) — skipping Stooq fetch")
-            return
-
     for ticker in universe:
-        # only fetch small amount: last ~400 trading days
         df = fetch_stooq_daily(ticker)
         if df.empty:
             print(f"[WARN] No data for {ticker}")
             continue
-
-        # keep only recent slice to reduce bandwidth + hits
-        df = df.tail(450)
 
         with get_conn() as conn:
             last_date = get_last_date_for_ticker(conn, ticker)
@@ -83,14 +59,33 @@ def load_prices_for_universe() -> pd.DataFrame:
     with get_conn() as conn:
         df = pd.read_sql_query(
             f"""
-            SELECT date, ticker, close
+            SELECT date, ticker, open, high, low, close, volume
             FROM prices_daily
             WHERE ticker IN ({placeholders})
             ORDER BY date ASC
             """,
             conn,
-            params=universe
+            params=universe,
         )
+
+    # Add synthetic cash series so model and backtest can allocate to cash
+    if not df.empty:
+        df["date"] = pd.to_datetime(df["date"])
+        cash_dates = df["date"].drop_duplicates()
+        cash = pd.DataFrame(
+            {
+                "date": cash_dates,
+                "ticker": "cash",
+                "open": 1.0,
+                "high": 1.0,
+                "low": 1.0,
+                "close": 1.0,
+                "volume": 0.0,
+            }
+        )
+        df = pd.concat([df, cash], ignore_index=True)
+        df = df.sort_values(["date", "ticker"]).reset_index(drop=True)
+
     return df
 
 
@@ -98,25 +93,25 @@ def save_recommendations(recs: pd.DataFrame) -> int:
     if recs.empty:
         return 0
 
-    recs = recs.drop_duplicates(subset=["asof_date", "ticker"], keep="last")
-
-    asof = recs["asof_date"].iloc[0]
+    # Fix UNIQUE constraint failures
+    recs = recs.drop_duplicates(subset=["asof_date", "ticker"], keep="last").copy()
 
     rows = []
     for _, r in recs.iterrows():
-        rows.append((
-            r["asof_date"], r["ticker"], r["action"],
-            float(r["score"]), float(r["target_weight"]), r["reasons"]
-        ))
+        rows.append((r["asof_date"], r["ticker"], r["action"], float(r["score"]), float(r["target_weight"]), r["reasons"]))
 
     with get_conn() as conn:
-        conn.execute("DELETE FROM recommendations WHERE asof_date = ?", (asof,))
         conn.executemany(
             """
             INSERT INTO recommendations (asof_date, ticker, action, score, target_weight, reasons)
             VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(asof_date, ticker) DO UPDATE SET
+                action=excluded.action,
+                score=excluded.score,
+                target_weight=excluded.target_weight,
+                reasons=excluded.reasons
             """,
-            rows
+            rows,
         )
     return len(rows)
 
@@ -138,9 +133,36 @@ def _latest_close_map() -> dict:
             ON p1.ticker = p2.ticker AND p1.date = p2.max_date
             """,
             conn,
-            params=universe
+            params=universe,
         )
-    return dict(zip(df["ticker"], df["close"]))
+    m = dict(zip(df["ticker"], df["close"]))
+    m["cash"] = 1.0
+    return m
+
+
+def _apply_turnover_controls(w_current: dict, w_target: dict, band: float, max_turnover: float) -> dict:
+    keys = set(w_current.keys()) | set(w_target.keys())
+    wc = {k: w_current.get(k, 0.0) for k in keys}
+    wt = {k: w_target.get(k, 0.0) for k in keys}
+
+    for k in list(keys):
+        if abs(wt[k] - wc[k]) < band:
+            wt[k] = wc[k]
+
+    s = sum(wt.values())
+    if s > 0:
+        wt = {k: v / s for k, v in wt.items()}
+
+    turnover = sum(abs(wt[k] - wc[k]) for k in keys) / 2.0
+    if turnover > max_turnover and turnover > 1e-12:
+        scale = max_turnover / turnover
+        wt = {k: wc[k] + (wt[k] - wc[k]) * scale for k in keys}
+        s2 = sum(max(0.0, v) for v in wt.values())
+        if s2 > 0:
+            wt = {k: max(0.0, v) / s2 for k, v in wt.items()}
+
+    wt = {k: v for k, v in wt.items() if v > 1e-6}
+    return wt
 
 
 def save_model_holdings_and_trades() -> None:
@@ -155,31 +177,53 @@ def save_model_holdings_and_trades() -> None:
             """
             SELECT ticker, target_weight
             FROM recommendations
-            WHERE asof_date = ?
+            WHERE asof_date = ? AND target_weight > 0
             """,
             conn,
-            params=(asof,)
+            params=(asof,),
         )
         if recs.empty:
             return
 
         price_map = _latest_close_map()
-        recs["price"] = recs["ticker"].map(price_map).astype(float)
-        recs = recs.dropna(subset=["price"])
 
-        recs["target_value"] = recs["target_weight"].astype(float) * float(PORTFOLIO_VALUE)
-        recs["shares"] = recs["target_value"] / recs["price"]
-        recs["value"] = recs["shares"] * recs["price"]
+        w_target = {}
+        for _, r in recs.iterrows():
+            tkr = r["ticker"]
+            if tkr in price_map:
+                w_target[tkr] = float(r["target_weight"])
+
+        s = sum(w_target.values())
+        if s > 0:
+            w_target = {k: v / s for k, v in w_target.items()}
+
+        cur2 = conn.execute("SELECT MAX(asof_date) FROM model_holdings WHERE asof_date < ?", (asof,))
+        prev_row = cur2.fetchone()
+        prev_asof = prev_row[0] if prev_row and prev_row[0] else None
+
+        w_current = {}
+        if prev_asof:
+            prev_df = pd.read_sql_query(
+                "SELECT ticker, target_weight FROM model_holdings WHERE asof_date = ?",
+                conn,
+                params=(prev_asof,),
+            )
+            if not prev_df.empty:
+                w_current = dict(zip(prev_df["ticker"], prev_df["target_weight"].astype(float)))
+                sc = sum(w_current.values())
+                if sc > 0:
+                    w_current = {k: v / sc for k, v in w_current.items()}
+
+        w_adjusted = _apply_turnover_controls(w_current, w_target, NO_TRADE_BAND, MAX_TURNOVER)
 
         holdings_rows = []
-        for _, r in recs.iterrows():
-            holdings_rows.append((
-                asof, r["ticker"],
-                float(r["target_weight"]),
-                float(r["price"]),
-                float(r["shares"]),
-                float(r["value"]),
-            ))
+        for tkr, w in w_adjusted.items():
+            px = price_map.get(tkr)
+            if px is None:
+                continue
+            val = w * float(PORTFOLIO_VALUE)
+            sh = val / px
+            holdings_rows.append((asof, tkr, w, px, sh, val))
 
         conn.executemany(
             """
@@ -191,35 +235,40 @@ def save_model_holdings_and_trades() -> None:
                 shares=excluded.shares,
                 value=excluded.value
             """,
-            holdings_rows
+            holdings_rows,
         )
 
-        cur2 = conn.execute(
-            "SELECT MAX(asof_date) FROM model_holdings WHERE asof_date < ?",
-            (asof,)
-        )
-        prev_row = cur2.fetchone()
-        prev_asof = prev_row[0] if prev_row and prev_row[0] else None
-
-        prev = pd.DataFrame(columns=["ticker", "shares"])
+        # Trades
+        prev_shares = {}
         if prev_asof:
-            prev = pd.read_sql_query(
+            prev_sh_df = pd.read_sql_query(
                 "SELECT ticker, shares FROM model_holdings WHERE asof_date = ?",
                 conn,
-                params=(prev_asof,)
+                params=(prev_asof,),
             )
-        prev_map = dict(zip(prev["ticker"], prev["shares"])) if not prev.empty else {}
+            if not prev_sh_df.empty:
+                prev_shares = dict(zip(prev_sh_df["ticker"], prev_sh_df["shares"].astype(float)))
 
         trades_rows = []
-        for _, r in recs.iterrows():
-            tkr = r["ticker"]
-            new_sh = float(r["shares"])
-            old_sh = float(prev_map.get(tkr, 0.0))
+        all_tickers = set(w_adjusted.keys()) | set(prev_shares.keys())
+        for tkr in all_tickers:
+            px = price_map.get(tkr)
+            if not px:
+                continue
+
+            new_w = w_adjusted.get(tkr, 0.0)
+            new_sh = (new_w * float(PORTFOLIO_VALUE)) / px
+            old_sh = prev_shares.get(tkr, 0.0)
             delta = new_sh - old_sh
+
             if abs(delta) < 1e-9:
                 continue
+
+            est_notional = abs(delta) * px
+            if est_notional < MIN_TRADE_GBP:
+                continue
+
             action = "BUY" if delta > 0 else "SELL"
-            est_notional = abs(delta) * float(r["price"])
             trades_rows.append((asof, tkr, action, float(delta), float(est_notional)))
 
         conn.execute("DELETE FROM model_trades WHERE asof_date = ?", (asof,))
@@ -229,52 +278,24 @@ def save_model_holdings_and_trades() -> None:
                 INSERT INTO model_trades (asof_date, ticker, trade_action, shares_delta, est_notional)
                 VALUES (?, ?, ?, ?, ?)
                 """,
-                trades_rows
+                trades_rows,
             )
 
-
-def _enrich_with_external_features(feats: pd.DataFrame) -> pd.DataFrame:
-    """
-    Adds:
-      - SEC filings features (10-K, 10-Q, 8-K + days-since + counts)
-      - News sentiment/volume + analyst event flags (upgrade/downgrade/PT changes)
-    """
-    if feats.empty:
-        return feats
-
-    feats = feats.copy()
-    feats["date"] = pd.to_datetime(feats["date"])
-    feats["ticker"] = feats["ticker"].astype(str).str.lower()
-
-    tickers = sorted(feats["ticker"].unique().tolist())
-    start = feats["date"].min()
-    end = feats["date"].max()
-
-    # SEC filings (free, high quality)
-    sec_df = build_sec_filing_features(tickers, start_date=start, end_date=end)
-    if not sec_df.empty:
-        sec_df["date"] = pd.to_datetime(sec_df["date"])
-        sec_df["ticker"] = sec_df["ticker"].astype(str).str.lower()
-        feats = feats.merge(sec_df, on=["date", "ticker"], how="left")
-
-    # News + “analyst event” detection via RSS headlines (free, patchy)
-    news_df = build_news_features(tickers, start_date=start, end_date=end)
-    if not news_df.empty:
-        news_df["date"] = pd.to_datetime(news_df["date"])
-        news_df["ticker"] = news_df["ticker"].astype(str).str.lower()
-        feats = feats.merge(news_df, on=["date", "ticker"], how="left")
-
-    # Fill missing numeric externals safely
-    external_cols = [c for c in feats.columns if c.startswith(("filing_", "days_since_", "filings_", "sent_", "news_", "upgrades_", "downgrades_", "pt_"))]
-    for c in external_cols:
-        feats[c] = pd.to_numeric(feats[c], errors="coerce").fillna(0.0)
-
-    return feats
+        turnover = sum(abs(w_adjusted.get(k, 0.0) - w_current.get(k, 0.0)) for k in all_tickers) / 2.0
+        print(f"[OK] Turnover this month: {turnover*100:.1f}% (cap: {MAX_TURNOVER*100:.0f}%)")
+        print(f"[OK] {len(trades_rows)} trades, {len(holdings_rows)} holdings")
 
 
 def run_pipeline() -> None:
     init_db()
     update_all_prices()
+
+    try:
+        news_features = update_news_sentiment()
+        print(f"[OK] News sentiment: {len(news_features)} ticker scores")
+    except Exception as e:
+        print(f"[WARN] News sentiment failed (continuing without): {e}")
+        news_features = None
 
     prices = load_prices_for_universe()
     if prices.empty:
@@ -282,10 +303,23 @@ def run_pipeline() -> None:
         return
 
     feats = build_feature_frame(prices)
-
-    feats = _enrich_with_external_features(feats)
-
     feats = add_cross_sectional_zscores(feats)
+    feats = add_sector_relative_features(feats)
+
+    if news_features is not None and not news_features.empty:
+        feats["date"] = pd.to_datetime(feats["date"])
+        news_features["date"] = pd.to_datetime(news_features["date"])
+        news_for_merge = news_features.drop(columns=["date"]).copy()
+        feats = feats.merge(news_for_merge, on="ticker", how="left")
+
+        for col in ["news_count_7d", "news_count_30d", "sent_mean_7d", "sent_mean_30d", "sent_shock"]:
+            if col in feats.columns:
+                feats[col] = feats[col].fillna(0.0)
+
+        print(f"[OK] Merged news features for {len(news_for_merge)} tickers")
+
+    n_feats = upsert_features(feats)
+    print(f"[OK] Saved {n_feats} feature rows")
 
     recs = make_monthly_recommendations(feats)
     n = save_recommendations(recs)

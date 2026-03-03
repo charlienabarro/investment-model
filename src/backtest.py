@@ -1,3 +1,4 @@
+# src/backtest.py
 import numpy as np
 import pandas as pd
 
@@ -34,15 +35,6 @@ def run_recommendation_backtest(
     initial_capital: float = 1.0,
     cost_bps: float = 5.0,
 ) -> tuple[pd.DataFrame, dict]:
-    """
-    prices columns: date, ticker, close
-    recs columns: asof_date, ticker, target_weight
-
-    Logic:
-    - At each rebalance signal date (asof_date), apply weights from next trading day onward
-    - Hold until next rebalance effective date
-    - Apply simple transaction cost on turnover at rebalances (cost_bps in basis points)
-    """
     if prices.empty or recs.empty:
         out = pd.DataFrame(columns=["date", "equity", "daily_return", "turnover"])
         stats = compute_perf_stats(pd.Series(dtype=float))
@@ -56,10 +48,17 @@ def run_recommendation_backtest(
     r["asof_date"] = pd.to_datetime(r["asof_date"])
     r = r.sort_values(["asof_date", "ticker"])
 
+    # Add synthetic cash if it is referenced or if weights do not sum to 1 later
+    if "cash" in set(r["ticker"].astype(str).str.lower()):
+        cash_dates = p["date"].drop_duplicates()
+        cash = pd.DataFrame({"date": cash_dates, "ticker": "cash", "close": 1.0})
+        p = pd.concat([p[["date", "ticker", "close"]], cash], ignore_index=True)
+    else:
+        p = p[["date", "ticker", "close"]].copy()
+
     px = p.pivot(index="date", columns="ticker", values="close").sort_index()
     ret = px.pct_change().fillna(0.0)
 
-    # Build schedule of target weights at each asof_date
     w_by_date = {}
     for d, g in r.groupby("asof_date"):
         g = g.copy()
@@ -67,10 +66,10 @@ def run_recommendation_backtest(
         if g.empty:
             w_by_date[d] = {}
             continue
-        weights = dict(zip(g["ticker"], g["target_weight"]))
-        s = sum(weights.values())
+        weights = dict(zip(g["ticker"].astype(str).str.lower(), g["target_weight"]))
+        s = float(sum(weights.values()))
         if s > 0:
-            weights = {k: v / s for k, v in weights.items()}
+            weights = {k: float(v) / s for k, v in weights.items()}
         w_by_date[d] = weights
 
     signal_dates = sorted(w_by_date.keys())
@@ -79,14 +78,12 @@ def run_recommendation_backtest(
         stats = compute_perf_stats(pd.Series(dtype=float))
         return out, stats
 
-    # Map each asof_date to the next trading day in price index to avoid lookahead
     trading_index = px.index
 
-    def next_trading_day(d: pd.Timestamp) -> pd.Timestamp | None:
+    def next_trading_day(d: pd.Timestamp):
         pos = trading_index.searchsorted(d)
         if pos >= len(trading_index):
             return None
-        # if asof_date is itself a trading day, executing next day is safer
         if trading_index[pos] == d:
             pos += 1
         if pos >= len(trading_index):
@@ -103,7 +100,6 @@ def run_recommendation_backtest(
         stats = compute_perf_stats(pd.Series(dtype=float))
         return out, stats
 
-    # Create a daily weight matrix
     weights_daily = pd.DataFrame(0.0, index=trading_index, columns=px.columns)
 
     for i, (sd, eff) in enumerate(effective):
@@ -114,12 +110,17 @@ def run_recommendation_backtest(
         if w:
             for tkr, val in w.items():
                 if tkr in weights_daily.columns:
-                    weights_daily.loc[(weights_daily.index >= start) & (weights_daily.index < end), tkr] = val
+                    mask = (weights_daily.index >= start) & (weights_daily.index < end)
+                    weights_daily.loc[mask, tkr] = float(val)
 
-    # Portfolio daily returns
+        # Any missing weight becomes cash, so you never get a frozen curve due to sum < 1
+        mask = (weights_daily.index >= start) & (weights_daily.index < end)
+        row_sum = weights_daily.loc[mask].sum(axis=1)
+        if "cash" in weights_daily.columns:
+            weights_daily.loc[mask, "cash"] = (1.0 - row_sum).clip(lower=0.0)
+
     port_ret = (weights_daily.shift(1).fillna(0.0) * ret).sum(axis=1)
 
-    # Transaction costs on rebalance effective dates
     turnover = pd.Series(0.0, index=trading_index)
     prev_w = pd.Series(0.0, index=px.columns)
 
@@ -131,15 +132,16 @@ def run_recommendation_backtest(
 
     cost = turnover * (cost_bps / 10000.0)
     net_ret = port_ret - cost
-
     equity = (1.0 + net_ret).cumprod() * initial_capital
 
-    out = pd.DataFrame({
-        "date": trading_index,
-        "equity": equity.values,
-        "daily_return": net_ret.values,
-        "turnover": turnover.values,
-    })
+    out = pd.DataFrame(
+        {
+            "date": trading_index,
+            "equity": equity.values,
+            "daily_return": net_ret.values,
+            "turnover": turnover.values,
+        }
+    )
 
     stats = compute_perf_stats(equity)
     return out, stats

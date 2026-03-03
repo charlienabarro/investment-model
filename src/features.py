@@ -1,4 +1,4 @@
-# src/features.py — V3: volume, macro regime, sector-relative features
+# src/features.py
 from __future__ import annotations
 
 import numpy as np
@@ -6,8 +6,6 @@ import pandas as pd
 
 from .risk_policy import GROUP_MAP, DEFAULT_GROUP
 
-
-# ── Sector mapping (reuse risk_policy groups for sector classification) ──
 
 SECTOR_MAP = {
     "us_equity": "equity_index",
@@ -23,8 +21,6 @@ def _sector_of(ticker: str) -> str:
     grp = GROUP_MAP.get(ticker, DEFAULT_GROUP)
     return SECTOR_MAP.get(grp, "stock")
 
-
-# ── Per-ticker feature builders ────────────────────────────
 
 def _pct_change_over(prices: pd.Series, periods: int) -> pd.Series:
     return prices.pct_change(periods=periods)
@@ -71,48 +67,35 @@ def _gap_ratio(prices: pd.Series, window: int = 63) -> pd.Series:
     return is_gap.rolling(window, min_periods=1).mean()
 
 
-# ── Volume features ────────────────────────────────────────
-
 def _relative_volume(volume: pd.Series, window: int = 20) -> pd.Series:
-    """Today's volume / rolling average volume. >1 = unusually high."""
     avg = volume.rolling(window, min_periods=max(1, window // 2)).mean()
     return volume / (avg + 1e-6)
 
 
 def _volume_price_trend(close: pd.Series, volume: pd.Series, window: int = 21) -> pd.Series:
-    """Cumulative volume-weighted price change over window. Positive = buying pressure."""
     ret = close.pct_change()
     vpt = (ret * volume).rolling(window, min_periods=1).sum()
-    # Normalise by average volume to make it comparable
     avg_vol = volume.rolling(window, min_periods=1).mean()
     return vpt / (avg_vol + 1e-6)
 
 
 def _on_balance_volume_slope(close: pd.Series, volume: pd.Series, window: int = 21) -> pd.Series:
-    """Slope of OBV over window — rising OBV = accumulation."""
     direction = close.diff().apply(lambda x: 1.0 if x > 0 else (-1.0 if x < 0 else 0.0))
     obv = (direction * volume).cumsum()
-    # Slope via linear regression approximation: (OBV - OBV_shifted) / window
     return (obv - obv.shift(window)) / (window + 1e-12)
 
 
 def _volume_volatility(volume: pd.Series, window: int = 21) -> pd.Series:
-    """Volatility of volume itself — erratic volume can signal uncertainty."""
     log_vol = np.log1p(volume)
     return log_vol.rolling(window, min_periods=max(1, window // 2)).std()
 
 
 def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Input: prices_df columns: date, ticker, close (and optionally open, high, low, volume)
-    Output: long DF with V3 features per day per ticker
-    """
     df = prices_df.copy()
     df["date"] = pd.to_datetime(df["date"])
     df = df.sort_values(["ticker", "date"])
 
     has_volume = "volume" in df.columns
-
     out = []
 
     for tkr, g in df.groupby("ticker"):
@@ -120,39 +103,32 @@ def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
         px = g["close"].astype(float)
         ret1 = px.pct_change()
 
-        # ── Momentum (skip last month to avoid reversal) ──
         g["mom_12_1"] = _pct_change_over(px.shift(21), 252)
         g["mom_6_1"] = _pct_change_over(px.shift(21), 126)
         g["mom_3_1"] = _pct_change_over(px.shift(21), 63)
         g["mom_1_0"] = _pct_change_over(px, 21)
 
-        # ── Trend ──
         g["ma_50"] = px.rolling(50, min_periods=1).mean()
         g["ma_200"] = px.rolling(200, min_periods=1).mean()
         g["ma_200_ratio"] = px / (g["ma_200"] + 1e-12)
         g["trend_50_200"] = g["ma_50"] / (g["ma_200"] + 1e-12)
 
-        # ── Volatility / risk ──
         g["vol_21"] = _rolling_vol(ret1, 21)
         g["vol_63"] = _rolling_vol(ret1, 63)
         g["vol_252"] = _rolling_vol(ret1, 252)
         g["maxdd_252"] = _rolling_max_drawdown(px, 252)
         g["maxdd_63"] = _rolling_max_drawdown(px, 63)
 
-        # ── Risk-adjusted ──
         g["sharpe_63"] = _rolling_sharpe(ret1, 63)
         g["sharpe_252"] = _rolling_sharpe(ret1, 252)
 
-        # ── Mean reversion / relative value ──
         g["mr_zscore_21"] = _mean_reversion_zscore(px, 21)
         g["rsi_14"] = _rsi(px, 14)
 
-        # ── Higher-order risk ──
         g["skew_63"] = _rolling_skew(ret1, 63)
         g["gap_ratio_63"] = _gap_ratio(px, 63)
         g["vol_ratio_21_63"] = g["vol_21"] / (g["vol_63"] + 1e-12)
 
-        # ── Volume features (NEW) ──
         if has_volume:
             vol = g["volume"].astype(float).fillna(0.0)
             g["rvol_20"] = _relative_volume(vol, 20)
@@ -165,7 +141,6 @@ def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
             g["obv_slope_21"] = np.nan
             g["vol_vol_21"] = np.nan
 
-        # ── Sector tag (for sector-relative features later) ──
         g["sector"] = _sector_of(tkr)
 
         keep_cols = [
@@ -182,29 +157,14 @@ def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
         out.append(g[keep_cols])
 
     feats = pd.concat(out, ignore_index=True)
-
-    # ── Macro regime features (NEW) ──
-    # Derived from ETF proxies already in the universe
     feats = _add_macro_features(feats)
-
     return feats
 
 
-# ── Macro regime features ──────────────────────────────────
-
 def _add_macro_features(df: pd.DataFrame) -> pd.DataFrame:
-    """
-    Add market-wide features derived from ETF proxies:
-    - spy_mom_1m: SPY 1-month return (market trend)
-    - spy_vol_63: SPY 3-month realised vol (risk environment)
-    - yield_curve: TLT/SHY price ratio (bond curve slope proxy)
-    - credit_spread: LQD/HYG price ratio (credit stress proxy)
-    - gold_trend: GLD 3-month momentum (risk-off indicator)
-    """
     out = df.copy()
     out["date"] = pd.to_datetime(out["date"])
 
-    # Extract daily series for key ETFs
     macro_tickers = {
         "spy.us": "spy",
         "tlt.us": "tlt",
@@ -221,10 +181,8 @@ def _add_macro_features(df: pd.DataFrame) -> pd.DataFrame:
         sub = sub.rename(columns={"close": label})
         macro[label] = sub
 
-    # Build a single macro dataframe indexed by date
     if not macro:
-        # No macro tickers found — fill with NaN
-        for col in ["spy_mom_1m", "spy_vol_63", "yield_curve", "credit_spread", "gold_trend"]:
+        for col in ["spy_mom_1m", "spy_vol_63", "spy_vol_21", "spy_vol_5", "yield_curve", "credit_spread", "gold_trend"]:
             out[col] = np.nan
         return out
 
@@ -234,14 +192,19 @@ def _add_macro_features(df: pd.DataFrame) -> pd.DataFrame:
 
     macro_df = macro_df.sort_index().ffill()
 
-    # Compute macro features
     if "spy" in macro_df.columns:
         macro_df["spy_mom_1m"] = macro_df["spy"].pct_change(21)
         spy_ret = macro_df["spy"].pct_change()
+        # old signal
         macro_df["spy_vol_63"] = spy_ret.rolling(63, min_periods=10).std() * np.sqrt(252)
+        # new "right now" signals
+        macro_df["spy_vol_21"] = spy_ret.rolling(21, min_periods=10).std() * np.sqrt(252)
+        macro_df["spy_vol_5"] = spy_ret.rolling(5, min_periods=5).std() * np.sqrt(252)
     else:
         macro_df["spy_mom_1m"] = np.nan
         macro_df["spy_vol_63"] = np.nan
+        macro_df["spy_vol_21"] = np.nan
+        macro_df["spy_vol_5"] = np.nan
 
     if "tlt" in macro_df.columns and "shy" in macro_df.columns:
         macro_df["yield_curve"] = macro_df["tlt"] / (macro_df["shy"] + 1e-12)
@@ -258,16 +221,12 @@ def _add_macro_features(df: pd.DataFrame) -> pd.DataFrame:
     else:
         macro_df["gold_trend"] = np.nan
 
-    macro_cols = ["spy_mom_1m", "spy_vol_63", "yield_curve", "credit_spread", "gold_trend"]
+    macro_cols = ["spy_mom_1m", "spy_vol_63", "spy_vol_21", "spy_vol_5", "yield_curve", "credit_spread", "gold_trend"]
     macro_out = macro_df[macro_cols].copy()
 
-    # Merge macro features onto every row by date
     out = out.merge(macro_out, left_on="date", right_index=True, how="left")
-
     return out
 
-
-# ── Cross-sectional z-scores ──────────────────────────────
 
 ZSCORE_COLS = [
     "mom_12_1", "mom_6_1", "mom_3_1", "mom_1_0",
@@ -277,48 +236,31 @@ ZSCORE_COLS = [
     "mr_zscore_21", "rsi_14",
     "skew_63", "gap_ratio_63", "vol_ratio_21_63",
     "rvol_20", "vpt_21", "obv_slope_21", "vol_vol_21",
-    # Macro (z-scored across date too, so every ticker on the same date gets the same z — fine)
-    "spy_mom_1m", "spy_vol_63", "yield_curve", "credit_spread", "gold_trend",
+    "spy_mom_1m", "spy_vol_63", "spy_vol_21", "spy_vol_5",
+    "yield_curve", "credit_spread", "gold_trend",
 ]
-
 
 def add_cross_sectional_zscores(feats: pd.DataFrame) -> pd.DataFrame:
     df = feats.copy()
     df["date"] = pd.to_datetime(df["date"])
-
     for c in ZSCORE_COLS:
         if c not in df.columns:
             continue
-        z = df.groupby("date")[c].transform(
-            lambda s: (s - s.mean()) / (s.std() + 1e-12)
-        )
-        df[c + "_z"] = z
-
+        df[c + "_z"] = df.groupby("date")[c].transform(lambda s: (s - s.mean()) / (s.std() + 1e-12))
     return df
 
 
-# ── Sector-relative features (NEW) ────────────────────────
-
 def add_sector_relative_features(feats: pd.DataFrame) -> pd.DataFrame:
-    """
-    For key momentum/quality features, compute how each ticker compares
-    to its sector average on the same date. This captures "is AAPL strong
-    relative to other tech stocks" vs "is AAPL strong relative to everything."
-    """
     df = feats.copy()
     df["date"] = pd.to_datetime(df["date"])
-
     if "sector" not in df.columns:
         return df
 
     sector_rel_cols = ["mom_12_1", "mom_6_1", "mom_3_1", "sharpe_63", "vol_63", "ma_200_ratio"]
-
     for c in sector_rel_cols:
         if c not in df.columns:
             continue
-        # Sector mean on each date
         sector_mean = df.groupby(["date", "sector"])[c].transform("mean")
         sector_std = df.groupby(["date", "sector"])[c].transform("std")
         df[c + "_sec_rel"] = (df[c] - sector_mean) / (sector_std + 1e-12)
-
     return df

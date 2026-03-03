@@ -1,4 +1,4 @@
-# src/model.py — V4: walk-forward validated multi-timeframe ensemble
+# src/model.py
 from __future__ import annotations
 
 import warnings
@@ -6,16 +6,15 @@ from typing import Dict, List, Tuple
 
 import numpy as np
 import pandas as pd
-
 from .optimiser import optimise_long_only
 from .config import (
     EQUITY_K, BONDS_K, COMMS_K, TOTAL_K,
     MAX_WEIGHT, MIN_WEIGHT,
     CORR_WINDOW_DAYS, CORR_THRESHOLD,
     BUDGETS_BASE,
-    TARGET_VOL, VOL_LOOKBACK, VOL_FLOOR, VOL_CAP,
+    TARGET_VOL, VOL_FLOOR, VOL_CAP,
     DD_TILT_START, DD_TILT_MAX, DD_MAX_SHIFT, EQUITY_FLOOR,
-    ML_TRAIN_WINDOW_MONTHS, ML_MIN_TRAIN_SAMPLES, ML_FALLBACK_TO_ZSCORE,
+    ML_MIN_TRAIN_SAMPLES,
     ML_ENSEMBLE_WINDOWS,
 )
 from .risk_policy import GROUP_MAP, DEFAULT_GROUP, get_sector, MAX_PER_SECTOR
@@ -30,16 +29,23 @@ ML_FEATURES = [
     "mr_zscore_21_z", "rsi_14_z",
     "skew_63_z", "gap_ratio_63_z", "vol_ratio_21_63_z",
     "rvol_20_z", "vpt_21_z", "obv_slope_21_z", "vol_vol_21_z",
-    "spy_mom_1m_z", "spy_vol_63_z", "yield_curve_z", "credit_spread_z", "gold_trend_z",
+    "spy_mom_1m_z", "spy_vol_63_z", "spy_vol_21_z", "spy_vol_5_z",
+    "yield_curve_z", "credit_spread_z", "gold_trend_z",
     "mom_12_1_sec_rel", "mom_6_1_sec_rel", "mom_3_1_sec_rel",
     "sharpe_63_sec_rel", "vol_63_sec_rel", "ma_200_ratio_sec_rel",
 ]
 
 FALLBACK_WEIGHTS = {
-    "mom_12_1_z": 0.25, "mom_6_1_z": 0.15, "mom_3_1_z": 0.10,
-    "ma_200_ratio_z": 0.15, "trend_50_200_z": 0.10,
-    "vol_63_z": -0.15, "maxdd_252_z": -0.15,
-    "sharpe_63_z": 0.10, "vpt_21_z": 0.05, "obv_slope_21_z": 0.05,
+    "mom_12_1_z": 0.25,
+    "mom_6_1_z": 0.15,
+    "mom_3_1_z": 0.10,
+    "ma_200_ratio_z": 0.15,
+    "trend_50_200_z": 0.10,
+    "vol_63_z": -0.15,
+    "maxdd_252_z": -0.15,
+    "sharpe_63_z": 0.10,
+    "vpt_21_z": 0.05,
+    "obv_slope_21_z": 0.05,
 }
 
 WF_VAL_MONTHS = 6
@@ -65,12 +71,24 @@ KNOWN_ETFS = {
     "dbc.us", "pdbc.us", "djp.us", "uso.us", "ung.us", "dba.us", "cper.us", "copx.us",
 }
 
+CASH_TICKER = "cash"
+CASH_MAX_WEIGHT = 0.50
+
+NEWS_OVERLAY_WEIGHT = 0.10
+
+# hard safety: do not let either equity or bonds dominate
+MAX_EQUITY_BUDGET = 0.50
+MAX_BONDS_BUDGET = 0.50
+
 
 def _group_of(t: str) -> str:
     return GROUP_MAP.get(t, DEFAULT_GROUP)
 
 
 def _bucket_of(t: str) -> str:
+    t = (t or "").lower()
+    if t == CASH_TICKER:
+        return "cash"
     g = _group_of(t)
     if g == "bonds":
         return "bonds"
@@ -91,9 +109,7 @@ def _zscore_by_date(df: pd.DataFrame, cols: List[str]) -> pd.DataFrame:
     for c in cols:
         if c not in out.columns:
             continue
-        out[c + "_z"] = out.groupby("date")[c].transform(
-            lambda s: (s - s.mean()) / (s.std() + 1e-12)
-        )
+        out[c + "_z"] = out.groupby("date")[c].transform(lambda s: (s - s.mean()) / (s.std() + 1e-12))
     return out
 
 
@@ -104,11 +120,7 @@ def _prepare_ml_target(month_end: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def _train_lgbm_with_validation(
-    train_df: pd.DataFrame,
-    val_df: pd.DataFrame,
-    n_estimators: int = 300
-) -> Tuple[object, float]:
+def _train_lgbm_with_validation(train_df: pd.DataFrame, val_df: pd.DataFrame, n_estimators: int = 300) -> Tuple[object, float]:
     try:
         import lightgbm as lgb
     except ImportError:
@@ -129,10 +141,16 @@ def _train_lgbm_with_validation(
     if len(vl) < 20:
         model = lgb.LGBMRegressor(
             n_estimators=min(n_estimators, 150),
-            max_depth=4, learning_rate=0.05, subsample=0.8,
-            colsample_bytree=0.7, min_child_samples=20,
-            reg_alpha=0.1, reg_lambda=1.0,
-            random_state=42, verbose=-1, n_jobs=1,
+            max_depth=4,
+            learning_rate=0.05,
+            subsample=0.8,
+            colsample_bytree=0.7,
+            min_child_samples=20,
+            reg_alpha=0.1,
+            reg_lambda=1.0,
+            random_state=42,
+            verbose=-1,
+            n_jobs=1,
         )
         model.fit(X_train, y_train)
         model._feature_names = avail
@@ -143,14 +161,21 @@ def _train_lgbm_with_validation(
 
     model = lgb.LGBMRegressor(
         n_estimators=n_estimators,
-        max_depth=4, learning_rate=0.05, subsample=0.8,
-        colsample_bytree=0.7, min_child_samples=20,
-        reg_alpha=0.1, reg_lambda=1.0,
-        random_state=42, verbose=-1, n_jobs=1,
+        max_depth=4,
+        learning_rate=0.05,
+        subsample=0.8,
+        colsample_bytree=0.7,
+        min_child_samples=20,
+        reg_alpha=0.1,
+        reg_lambda=1.0,
+        random_state=42,
+        verbose=-1,
+        n_jobs=1,
     )
 
     model.fit(
-        X_train, y_train,
+        X_train,
+        y_train,
         eval_set=[(X_val, y_val)],
         callbacks=[lgb.early_stopping(stopping_rounds=30, verbose=False)],
     )
@@ -162,11 +187,8 @@ def _train_lgbm_with_validation(
         rank_corr, _ = spearmanr(preds, vl["fwd_ret_1m"].values)
         if np.isnan(rank_corr):
             rank_corr = 0.0
-    except ImportError:
-        rank_corr = float(pd.Series(preds).corr(
-            vl["fwd_ret_1m"].reset_index(drop=True),
-            method="spearman"
-        ))
+    except Exception:
+        rank_corr = float(pd.Series(preds).corr(vl["fwd_ret_1m"].reset_index(drop=True), method="spearman"))
         if np.isnan(rank_corr):
             rank_corr = 0.0
 
@@ -180,21 +202,13 @@ def _predict_scores(model, snap: pd.DataFrame) -> pd.Series:
     return pd.Series(scores, index=snap.index, name="ml_score")
 
 
-def _train_validated_ensemble(
-    month_end: pd.DataFrame,
-    current_month,
-    windows: List[int]
-) -> Tuple[List[object], float]:
+def _train_validated_ensemble(month_end: pd.DataFrame, current_month, windows: List[int]) -> Tuple[List[object], float]:
     models = []
     confidences = []
 
     for w in windows:
         train_start = current_month - w
-        full_window = month_end[
-            (month_end["month"] >= train_start) &
-            (month_end["month"] < current_month)
-        ].copy()
-
+        full_window = month_end[(month_end["month"] >= train_start) & (month_end["month"] < current_month)].copy()
         if len(full_window) < ML_MIN_TRAIN_SAMPLES:
             models.append(None)
             continue
@@ -223,8 +237,7 @@ def _ensemble_predict(models: List[object], snap: pd.DataFrame) -> pd.Series | N
         if m is None:
             continue
         try:
-            p = _predict_scores(m, snap)
-            preds.append(p)
+            preds.append(_predict_scores(m, snap))
         except Exception:
             continue
     if not preds:
@@ -232,22 +245,7 @@ def _ensemble_predict(models: List[object], snap: pd.DataFrame) -> pd.Series | N
     return pd.concat(preds, axis=1).mean(axis=1)
 
 
-def _compute_ml_confidence(val_confidence: float, recent_accuracy: float) -> float:
-    val_score = float(np.clip((val_confidence - 0.0) / 0.15, 0.0, 1.0))
-    if recent_accuracy > 0:
-        combined = 0.6 * val_score + 0.4 * recent_accuracy
-    else:
-        combined = val_score
-    confidence = ML_CONFIDENCE_FLOOR + combined * (ML_CONFIDENCE_CAP - ML_CONFIDENCE_FLOOR)
-    return float(np.clip(confidence, ML_CONFIDENCE_FLOOR, ML_CONFIDENCE_CAP))
-
-
-def _measure_recent_accuracy(
-    month_end: pd.DataFrame,
-    models: List[object],
-    current_month,
-    eval_months: int = 3
-) -> float:
+def _measure_recent_accuracy(month_end: pd.DataFrame, models: List[object], current_month, eval_months: int = 3) -> float:
     if not models or not any(m is not None for m in models):
         return 0.0
 
@@ -282,17 +280,20 @@ def _measure_recent_accuracy(
 
         top_actual = top_pred["fwd_ret_1m"].mean()
         bottom_actual = bottom_pred["fwd_ret_1m"].mean()
-
-        if top_actual > bottom_actual:
-            spread = top_actual - bottom_actual
-            hit_rates.append(min(1.0, 0.5 + spread * 10))
-        else:
-            hit_rates.append(max(0.0, 0.5 + (top_actual - bottom_actual) * 10))
+        spread = top_actual - bottom_actual
+        hit_rates.append(float(np.clip(0.5 + spread * 10.0, 0.0, 1.0)))
 
     if not hit_rates:
         return 0.0
 
     return float(np.mean(hit_rates))
+
+
+def _compute_ml_confidence(val_confidence: float, recent_accuracy: float) -> float:
+    val_score = float(np.clip(val_confidence / 0.15, 0.0, 1.0))
+    combined = 0.6 * val_score + 0.4 * (recent_accuracy if recent_accuracy > 0 else 0.0)
+    confidence = ML_CONFIDENCE_FLOOR + combined * (ML_CONFIDENCE_CAP - ML_CONFIDENCE_FLOOR)
+    return float(np.clip(confidence, ML_CONFIDENCE_FLOOR, ML_CONFIDENCE_CAP))
 
 
 def _fallback_score(df: pd.DataFrame) -> pd.Series:
@@ -301,9 +302,6 @@ def _fallback_score(df: pd.DataFrame) -> pd.Series:
         if col in df.columns:
             score = score + wt * df[col].astype(float).fillna(0.0)
     return score
-
-
-NEWS_OVERLAY_WEIGHT = 0.10
 
 
 def _apply_news_overlay(snap: pd.DataFrame) -> pd.DataFrame:
@@ -330,17 +328,37 @@ def _apply_news_overlay(snap: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _vol_scale_factor(snap: pd.DataFrame) -> float:
+def _market_vol_now(snap: pd.DataFrame) -> float:
+    """
+    Uses the fastest available SPY vol feature so it reacts immediately.
+    Priority: spy_vol_5, then spy_vol_21, then spy_vol_63, then vol_21/63 from SPY row.
+    """
     spy = snap[snap["ticker"] == "spy.us"]
     if spy.empty:
+        return TARGET_VOL
+
+    r = spy.iloc[0]
+
+    for key in ["spy_vol_5", "spy_vol_21", "spy_vol_63"]:
+        v = r.get(key, np.nan)
+        if pd.notna(v) and float(v) > 0:
+            return float(v)
+
+    v63 = r.get("vol_63", np.nan)
+    if pd.notna(v63) and float(v63) > 0:
+        return float(v63) * float(np.sqrt(252))
+
+    v21 = r.get("vol_21", np.nan)
+    if pd.notna(v21) and float(v21) > 0:
+        return float(v21) * float(np.sqrt(252))
+
+    return TARGET_VOL
+
+
+def _vol_scale_factor(snap: pd.DataFrame) -> float:
+    ann_vol = _market_vol_now(snap)
+    if not np.isfinite(ann_vol) or ann_vol <= 0:
         return 1.0
-    vol_col = "vol_63" if "vol_63" in spy.columns else None
-    if vol_col is None:
-        return 1.0
-    rv = float(spy[vol_col].iloc[0])
-    if np.isnan(rv) or rv <= 0:
-        return 1.0
-    ann_vol = rv * np.sqrt(252)
     return float(np.clip(TARGET_VOL / ann_vol, VOL_FLOOR, VOL_CAP))
 
 
@@ -349,9 +367,7 @@ def _drawdown_tilt(snap: pd.DataFrame) -> float:
     if spy.empty:
         return 0.0
     dd_col = "maxdd_63" if "maxdd_63" in spy.columns else "maxdd_252"
-    if dd_col not in spy.columns:
-        return 0.0
-    dd = float(spy[dd_col].iloc[0])
+    dd = float(spy.iloc[0].get(dd_col, 0.0))
     if np.isnan(dd):
         return 0.0
     if dd >= DD_TILT_START:
@@ -362,18 +378,63 @@ def _drawdown_tilt(snap: pd.DataFrame) -> float:
     return float(frac * DD_MAX_SHIFT)
 
 
+def _cash_weight(snap: pd.DataFrame) -> float:
+    spy = snap[snap["ticker"] == "spy.us"]
+    if spy.empty:
+        return 0.0
+
+    r = spy.iloc[0]
+    ma200 = float(r.get("ma_200_ratio", 1.0))
+    dd_col = "maxdd_63" if "maxdd_63" in spy.columns else "maxdd_252"
+    dd = float(r.get(dd_col, 0.0))
+    ann_vol = _market_vol_now(snap)
+
+    ma_stress = 1.0 if ma200 < 1.0 else 0.0
+    dd_stress = float(np.clip((DD_TILT_START - dd) / (DD_TILT_START - DD_TILT_MAX + 1e-12), 0.0, 1.0)) if np.isfinite(dd) else 0.0
+    vol_stress = float(np.clip((ann_vol - TARGET_VOL) / (TARGET_VOL + 1e-12), 0.0, 1.0)) if np.isfinite(ann_vol) else 0.0
+
+    # small news stress bonus if you have it
+    news_stress = 0.0
+    if "sent_shock" in snap.columns:
+        x = snap["sent_shock"].astype(float).replace([np.inf, -np.inf], np.nan).dropna()
+        if len(x) >= 10:
+            news_stress = float(np.clip(x.abs().mean() / 0.05, 0.0, 1.0))
+
+    stress = 0.40 * ma_stress + 0.30 * dd_stress + 0.20 * vol_stress + 0.10 * news_stress
+    cash_w = float(np.clip(stress * CASH_MAX_WEIGHT, 0.0, CASH_MAX_WEIGHT))
+    if cash_w < 0.02:
+        cash_w = 0.0
+    return cash_w
+
+
 def _adjusted_budgets(snap: pd.DataFrame) -> Dict[str, float]:
     b = dict(BUDGETS_BASE)
+
+    cash_w = _cash_weight(snap)
+    risky_total = 1.0 - cash_w
+
     vs = _vol_scale_factor(snap)
     b["equity"] *= vs
+
     tilt = _drawdown_tilt(snap)
-    shift = min(tilt, b["equity"] - EQUITY_FLOOR)
-    shift = max(shift, 0.0)
+    equity_floor_abs = float(EQUITY_FLOOR) * risky_total
+    shift = max(0.0, min(tilt, b["equity"] - (equity_floor_abs / max(risky_total, 1e-12))))
     b["equity"] -= shift
     b["bonds"] += shift
-    total = sum(b.values())
+
+    # Enforce hard caps so you never get 80 percent bonds etc
+    b["equity"] = min(float(b["equity"]), MAX_EQUITY_BUDGET)
+    b["bonds"] = min(float(b["bonds"]), MAX_BONDS_BUDGET)
+
+    risky_sum = float(b["equity"] + b["bonds"] + b["commodities"])
+    if risky_sum > 0:
+        b = {k: (float(v) / risky_sum) * risky_total for k, v in b.items()}
+
+    b["cash"] = cash_w
+
+    total = float(sum(b.values()))
     if total > 0:
-        b = {k: v / total for k, v in b.items()}
+        b = {k: float(v) / total for k, v in b.items()}
     return b
 
 
@@ -392,16 +453,9 @@ def _trailing_returns_pivot(prices_df: pd.DataFrame, end_date: pd.Timestamp, win
     return rets
 
 
-def _corr_filter_select_with_sector_cap(
-    candidates: pd.DataFrame,
-    rets: pd.DataFrame,
-    k: int,
-    threshold: float,
-    max_per_sector: int,
-) -> List[str]:
+def _corr_filter_select_with_sector_cap(candidates: pd.DataFrame, rets: pd.DataFrame, k: int, threshold: float, max_per_sector: int) -> List[str]:
     if candidates.empty:
         return []
-
     ordered = candidates.sort_values("score", ascending=False).copy()
     ordered["sector"] = ordered["ticker"].map(get_sector)
 
@@ -532,7 +586,8 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
         "mr_zscore_21", "rsi_14",
         "skew_63", "gap_ratio_63", "vol_ratio_21_63",
         "rvol_20", "vpt_21", "obv_slope_21", "vol_vol_21",
-        "spy_mom_1m", "spy_vol_63", "yield_curve", "credit_spread", "gold_trend",
+        "spy_mom_1m", "spy_vol_63", "spy_vol_21", "spy_vol_5",
+        "yield_curve", "credit_spread", "gold_trend",
     ]
     missing_z = [c for c in raw_cols if (c + "_z") not in month_end.columns and c in month_end.columns]
     if missing_z:
@@ -564,11 +619,9 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
             ml_confidence = _compute_ml_confidence(val_confidence, recent_acc)
 
         ensemble_score = _ensemble_predict(ensemble_models, snap) if ensemble_models else None
-
         if ensemble_score is not None:
-            ml_score = ensemble_score
             fb_score = _fallback_score(snap)
-            snap["score"] = ml_confidence * ml_score + (1.0 - ml_confidence) * fb_score
+            snap["score"] = ml_confidence * ensemble_score + (1.0 - ml_confidence) * fb_score
             scoring_method = f"ensemble(conf={ml_confidence:.0%})"
         else:
             snap["score"] = _fallback_score(snap)
@@ -585,47 +638,27 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
         eq = _apply_hysteresis(eq, prev_month_holdings, boost=0.15)
         eq = eq.sort_values("score", ascending=False).head(80)
 
-        rets = pd.DataFrame()
-        if not prices_for_corr.empty:
-            rets = _trailing_returns_pivot(prices_for_corr, end_date, CORR_WINDOW_DAYS)
+        rets = _trailing_returns_pivot(prices_for_corr, end_date, CORR_WINDOW_DAYS) if not prices_for_corr.empty else pd.DataFrame()
 
         eq_selected = _corr_filter_select_with_sector_cap(eq, rets, EQUITY_K, CORR_THRESHOLD, MAX_PER_SECTOR)
         eq_selected = _enforce_semis_name_cap(eq_selected, eq)
         bd_selected = bd["ticker"].tolist()[:BONDS_K]
         cm_selected = cm["ticker"].tolist()[:COMMS_K]
 
-        selected = list(eq_selected) + list(bd_selected) + list(cm_selected)
-        selected = [t.lower() for t in selected if t]
-        selected = list(dict.fromkeys(selected))[:TOTAL_K]
+        selected = list(dict.fromkeys([t.lower() for t in (eq_selected + bd_selected + cm_selected)]))[:TOTAL_K]
         if not selected:
             continue
 
         mu = snap.set_index("ticker").reindex(selected)["score"].astype(float).fillna(0.0)
+        rets = _trailing_returns_pivot(prices_for_corr, end_date, CORR_WINDOW_DAYS) if not prices_for_corr.empty else pd.DataFrame()
 
-        if prices_for_corr.empty:
-            rets = pd.DataFrame()
-        else:
-            rets = _trailing_returns_pivot(prices_for_corr, end_date, CORR_WINDOW_DAYS)
-
-        base_caps = pd.Series(
-            {t: (MAX_ETF_WEIGHT if _is_etf(t) else MAX_STOCK_WEIGHT) for t in selected},
-            index=selected,
-            dtype=float,
-        )
-        if "slv.us" in base_caps.index:
-            base_caps["slv.us"] = min(base_caps["slv.us"], MAX_SLV_WEIGHT)
-
-        sector_caps = {}
-        for t in selected:
-            sec = get_sector(t)
-            if sec not in sector_caps:
-                sector_caps[sec] = 0.35
+        caps = pd.Series({t: (MAX_ETF_WEIGHT if _is_etf(t) else MAX_STOCK_WEIGHT) for t in selected}, index=selected, dtype=float)
+        if "slv.us" in caps.index:
+            caps["slv.us"] = min(caps["slv.us"], MAX_SLV_WEIGHT)
 
         sector_map = {t: get_sector(t) for t in selected}
-
-        group_caps = {
-            "semis_storage": (SEMIS_STORAGE, SEMIS_MAX_TOTAL),
-        }
+        sector_caps = {sec: 0.35 for sec in set(sector_map.values())}
+        group_caps = {"semis_storage": (SEMIS_STORAGE, SEMIS_MAX_TOTAL)}
 
         prev_w = pd.Series(0.0, index=selected)
         if prev_month_holdings:
@@ -637,46 +670,31 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
             tickers=selected,
             mu=mu,
             returns=rets,
-            caps=base_caps,
+            caps=caps,
             min_w=float(MIN_WEIGHT),
             sector_map=sector_map,
             sector_caps=sector_caps,
             group_caps=group_caps,
             prev_w=prev_w,
-            risk_aversion=10.0,
-            turnover_penalty=0.6,
-            l2_penalty=0.05,
-            cov_shrink=0.15,
+            risk_aversion=12.0,
+            turnover_penalty=0.8,
+            l2_penalty=0.08,
+            cov_shrink=0.20,
         )
         weights = res.weights
         if weights is None or len(weights) == 0:
             continue
 
-        weights = weights.copy().astype(float)
-        weights[~np.isfinite(weights)] = 0.0
-        weights = weights.clip(lower=0.0)
-
-        s = float(weights.sum())
-        if s <= 0:
-            continue
-        weights = weights / s
-
-        weights = weights[weights >= (MIN_WEIGHT - 1e-9)]
+        weights = weights / float(weights.sum())
+        weights = weights[weights >= MIN_WEIGHT - 1e-6]
         if weights.empty:
             continue
-        weights = weights.sort_values(ascending=False).head(TOTAL_K)
         weights = weights / float(weights.sum())
 
-        final_caps = pd.Series(
-            {t: (MAX_ETF_WEIGHT if _is_etf(t) else MAX_STOCK_WEIGHT) for t in weights.index},
-            index=weights.index,
-            dtype=float,
-        )
-        if "slv.us" in final_caps.index:
-            final_caps["slv.us"] = min(final_caps["slv.us"], MAX_SLV_WEIGHT)
-
-        weights = _cap_redistribute(weights, final_caps)
-        weights = weights / float(weights.sum())
+        caps2 = pd.Series({t: (MAX_ETF_WEIGHT if _is_etf(t) else MAX_STOCK_WEIGHT) for t in weights.index}, index=weights.index, dtype=float)
+        if "slv.us" in caps2.index:
+            caps2["slv.us"] = min(caps2["slv.us"], MAX_SLV_WEIGHT)
+        weights = _cap_redistribute(weights, caps2)
 
         semis_names = [t for t in weights.index if t in SEMIS_STORAGE]
         if semis_names:
@@ -685,51 +703,36 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
                 shrink = SEMIS_MAX_TOTAL / semis_total
                 weights.loc[semis_names] *= shrink
                 non = [t for t in weights.index if t not in SEMIS_STORAGE]
-                if non and float(weights.loc[non].sum()) > 0:
-                    weights.loc[non] *= (1.0 / float(weights.loc[non].sum())) * (1.0 - float(weights.loc[semis_names].sum()))
-                weights = _cap_redistribute(weights / float(weights.sum()), final_caps)
+                if non and float(weights.loc[non].sum()) > 1e-12:
+                    weights.loc[non] *= (1.0 - float(weights.loc[semis_names].sum())) / float(weights.loc[non].sum())
+                weights = _cap_redistribute(weights / float(weights.sum()), caps2)
 
         weights = weights / float(weights.sum())
 
-        vol_scale = _vol_scale_factor(snap)
+        cash_w = float(np.clip(budgets.get("cash", 0.0), 0.0, CASH_MAX_WEIGHT))
+        weights = weights * (1.0 - cash_w)
+
+        vol_now = _market_vol_now(snap)
         dd_shift = _drawdown_tilt(snap)
 
         for tkr, w in weights.items():
             row = snap[snap["ticker"] == tkr]
             sc = float(row["score"].iloc[0]) if not row.empty else 0.0
             bucket = _bucket_of(tkr)
-            parts: List[str] = []
 
+            parts = []
             parts.append(f"Scoring: {scoring_method}.")
-            if bucket == "equity":
-                parts.append(f"Selected as top equity holding (corr-filtered, {EQUITY_K} slots).")
-            elif bucket == "bonds":
-                parts.append("Bond allocation for stability.")
-            else:
-                parts.append("Commodity allocation for diversification.")
-
-            mom12 = row.get("mom_12_1", pd.Series([np.nan])).iloc[0] if not row.empty else np.nan
-            ma200 = row.get("ma_200_ratio", pd.Series([np.nan])).iloc[0] if not row.empty else np.nan
-            if pd.notna(mom12):
-                parts.append(f"12m momentum: {float(mom12):.2f}.")
-            if pd.notna(ma200):
-                parts.append("Above 200d MA." if float(ma200) > 1.0 else "Below 200d MA.")
-
-            rvol = row.get("rvol_20", pd.Series([np.nan])).iloc[0] if not row.empty else np.nan
-            if pd.notna(rvol) and rvol > 1.5:
-                parts.append("Unusually high recent trading volume.")
-
-            spy_vol = row.get("spy_vol_63", pd.Series([np.nan])).iloc[0] if not row.empty else np.nan
-            if pd.notna(spy_vol) and spy_vol > 0.20:
-                parts.append("Elevated market volatility environment.")
-
-            parts.append(f"Vol scale: {vol_scale:.2f}x.")
+            parts.append(f"Market vol now: {vol_now:.2%}.")
             if dd_shift > 0.001:
-                parts.append(f"DD tilt: shifted {dd_shift*100:.1f}% to bonds.")
+                parts.append(f"Drawdown tilt active.")
             parts.append(f"Target weight: {float(w)*100:.1f}%.")
 
-            eq_pct, bd_pct, cm_pct = budgets["equity"] * 100, budgets["bonds"] * 100, budgets["commodities"] * 100
-            parts.append(f"Budgets: eq {eq_pct:.0f}% / bd {bd_pct:.0f}% / cm {cm_pct:.0f}%.")
+            parts.append(
+                f"Budgets: eq {budgets.get('equity',0.0)*100:.0f}% / "
+                f"bd {budgets.get('bonds',0.0)*100:.0f}% / "
+                f"cm {budgets.get('commodities',0.0)*100:.0f}% / "
+                f"cash {budgets.get('cash',0.0)*100:.0f}%."
+            )
 
             all_recs.append({
                 "asof_date": asof_date,
@@ -738,6 +741,16 @@ def make_monthly_recommendations(features_df: pd.DataFrame) -> pd.DataFrame:
                 "score": sc,
                 "target_weight": float(w),
                 "reasons": " ".join(parts),
+            })
+
+        if cash_w > 1e-6:
+            all_recs.append({
+                "asof_date": asof_date,
+                "ticker": CASH_TICKER,
+                "action": "HOLD_CASH",
+                "score": 0.0,
+                "target_weight": float(cash_w),
+                "reasons": f"Cash sleeve for risk control. Target weight: {cash_w*100:.1f}%.",
             })
 
         prev_month_holdings = set(weights.index.tolist())

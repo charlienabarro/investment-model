@@ -36,6 +36,9 @@ DEFAULT_GROUP = "us_equity"
 MAX_PER_SECTOR = 2
 
 SECTOR_MAP = {
+    # TODO: add sector mappings for common unmapped universe names such as
+    # tsla.us, brk.b.us/brkb.us, cost.us, nflx.us, avgo.us, lly.us, unh.us,
+    # tmo.us, dhr.us, lin.us, now.us, pld.us, isrg.us, and eqix.us.
     # Semis / hardware
     "asml.us": "Semiconductors",
     "nvda.us": "Semiconductors",

@@ -34,11 +34,12 @@ def run_recommendation_backtest(
     recs: pd.DataFrame,
     initial_capital: float = 1.0,
     cost_bps: float = 5.0,
-) -> tuple[pd.DataFrame, dict]:
+    benchmark_weights: dict[str, float] | None = None,
+) -> tuple[pd.DataFrame, dict, pd.Series]:
     if prices.empty or recs.empty:
         out = pd.DataFrame(columns=["date", "equity", "daily_return", "turnover"])
         stats = compute_perf_stats(pd.Series(dtype=float))
-        return out, stats
+        return out, stats, pd.Series(dtype=float)
 
     p = prices.copy()
     p["date"] = pd.to_datetime(p["date"])
@@ -57,7 +58,7 @@ def run_recommendation_backtest(
         p = p[["date", "ticker", "close"]].copy()
 
     px = p.pivot(index="date", columns="ticker", values="close").sort_index()
-    ret = px.pct_change().fillna(0.0)
+    ret = px.pct_change(fill_method=None).fillna(0.0)
 
     w_by_date = {}
     for d, g in r.groupby("asof_date"):
@@ -76,7 +77,7 @@ def run_recommendation_backtest(
     if not signal_dates:
         out = pd.DataFrame(columns=["date", "equity", "daily_return", "turnover"])
         stats = compute_perf_stats(pd.Series(dtype=float))
-        return out, stats
+        return out, stats, pd.Series(dtype=float)
 
     trading_index = px.index
 
@@ -98,7 +99,7 @@ def run_recommendation_backtest(
     if not effective:
         out = pd.DataFrame(columns=["date", "equity", "daily_return", "turnover"])
         stats = compute_perf_stats(pd.Series(dtype=float))
-        return out, stats
+        return out, stats, pd.Series(dtype=float)
 
     weights_daily = pd.DataFrame(0.0, index=trading_index, columns=px.columns)
 
@@ -144,4 +145,18 @@ def run_recommendation_backtest(
     )
 
     stats = compute_perf_stats(equity)
-    return out, stats
+
+    weights = benchmark_weights or {"spy.us": 0.60, "ief.us": 0.40}
+    available = [t for t in weights if t in px.columns]
+    benchmark = pd.Series(dtype=float)
+    if available:
+        bpx = px[available].replace(0.0, np.nan).ffill().dropna(how="any")
+        if not bpx.empty:
+            bw = pd.Series({t: float(weights[t]) for t in available}, dtype=float)
+            bw = bw / float(bw.sum())
+            start_prices = bpx.iloc[0]
+            shares = (initial_capital * bw) / start_prices
+            benchmark = bpx.mul(shares, axis=1).sum(axis=1)
+            benchmark = benchmark / float(benchmark.iloc[0]) * initial_capital
+
+    return out, stats, benchmark

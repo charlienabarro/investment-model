@@ -102,6 +102,8 @@ def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
         g = g.sort_values("date").copy()
         px = g["close"].astype(float)
         ret1 = px.pct_change()
+        log_ret = np.log(px / px.shift(1))
+        daily_vol = log_ret.abs()
 
         g["mom_12_1"] = _pct_change_over(px.shift(21), 252)
         g["mom_6_1"] = _pct_change_over(px.shift(21), 126)
@@ -112,10 +114,12 @@ def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
         g["ma_200"] = px.rolling(200, min_periods=1).mean()
         g["ma_200_ratio"] = px / (g["ma_200"] + 1e-12)
         g["trend_50_200"] = g["ma_50"] / (g["ma_200"] + 1e-12)
+        g["high_52w_ratio"] = px / (px.rolling(252, min_periods=1).max() + 1e-12)
 
         g["vol_21"] = _rolling_vol(ret1, 21)
         g["vol_63"] = _rolling_vol(ret1, 63)
         g["vol_252"] = _rolling_vol(ret1, 252)
+        g["vol_of_vol_21"] = daily_vol.rolling(63, min_periods=21).std()
         g["maxdd_252"] = _rolling_max_drawdown(px, 252)
         g["maxdd_63"] = _rolling_max_drawdown(px, 63)
 
@@ -146,8 +150,8 @@ def build_feature_frame(prices_df: pd.DataFrame) -> pd.DataFrame:
         keep_cols = [
             "date", "ticker", "close", "sector",
             "mom_12_1", "mom_6_1", "mom_3_1", "mom_1_0",
-            "ma_200_ratio", "trend_50_200",
-            "vol_21", "vol_63", "vol_252",
+            "ma_200_ratio", "trend_50_200", "high_52w_ratio",
+            "vol_21", "vol_63", "vol_252", "vol_of_vol_21",
             "maxdd_252", "maxdd_63",
             "sharpe_63", "sharpe_252",
             "mr_zscore_21", "rsi_14",
@@ -230,8 +234,8 @@ def _add_macro_features(df: pd.DataFrame) -> pd.DataFrame:
 
 ZSCORE_COLS = [
     "mom_12_1", "mom_6_1", "mom_3_1", "mom_1_0",
-    "ma_200_ratio", "trend_50_200",
-    "vol_63", "vol_252", "maxdd_252", "maxdd_63",
+    "ma_200_ratio", "trend_50_200", "high_52w_ratio",
+    "vol_63", "vol_252", "vol_of_vol_21", "maxdd_252", "maxdd_63",
     "sharpe_63", "sharpe_252",
     "mr_zscore_21", "rsi_14",
     "skew_63", "gap_ratio_63", "vol_ratio_21_63",

@@ -47,6 +47,9 @@ TICKER_NAME_MAP = {
     "hyg.us": "High yield bonds HYG",
 }
 
+_FINBERT = None
+_FINBERT_AVAILABLE: bool | None = None
+
 
 def _search_name(ticker: str) -> str:
     """Convert ticker to a Google News search query."""
@@ -137,8 +140,32 @@ def _fetch_google_news_rss(query: str, days_back: int = 30) -> List[Dict]:
 
 def _score_sentiment(headline: str) -> float:
     """
-    Score a headline using VADER. Returns compound score (-1 to +1).
+    Score a headline using optional FinBERT, falling back to VADER.
+    Returns compound score (-1 to +1).
     """
+    global _FINBERT, _FINBERT_AVAILABLE
+
+    # TODO: FinBERT requires ~500MB model download on first use. Consider
+    # caching the model locally in data/finbert/. Set HF_HOME env var to
+    # control cache location.
+    if _FINBERT_AVAILABLE is not False:
+        try:
+            if _FINBERT is None:
+                from transformers import pipeline
+                _FINBERT = pipeline("sentiment-analysis", model="ProsusAI/finbert")
+                _FINBERT_AVAILABLE = True
+            result = _FINBERT(headline or "")[0]
+            label = str(result.get("label", "")).lower()
+            score = float(result.get("score", 0.0))
+            if "positive" in label:
+                return max(-1.0, min(1.0, 2.0 * score - 1.0))
+            if "negative" in label:
+                return max(-1.0, min(1.0, 1.0 - 2.0 * score))
+            if "neutral" in label:
+                return 0.0
+        except Exception:
+            _FINBERT_AVAILABLE = False
+
     from vaderSentiment.vaderSentiment import SentimentIntensityAnalyzer
 
     analyzer = SentimentIntensityAnalyzer()

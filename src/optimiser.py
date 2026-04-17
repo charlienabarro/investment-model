@@ -25,6 +25,10 @@ def _shrink_cov(returns: pd.DataFrame, shrink: float = 0.10) -> np.ndarray:
     Sigma_shrunk = (1-shrink)*Sigma + shrink*diag(Sigma)
     """
     x = returns.dropna(how="any")
+    if x.shape[1] == 0:
+        return np.zeros((0, 0))
+    if x.shape[0] == 0:
+        return np.eye(x.shape[1]) * 1e-4
     if x.shape[0] < 30 or x.shape[1] < 2:
         v = np.nanvar(x.values, axis=0)
         v = np.where(np.isfinite(v) & (v > 1e-12), v, 1e-4)
@@ -83,6 +87,7 @@ def optimise_long_only(
     Sigma = _shrink_cov(R, shrink=cov_shrink)
 
     n = len(idx)
+    fallback_w = pd.Series(1.0 / n, index=idx)
     w = cp.Variable(n)
 
     mu_vec = mu.values
@@ -123,10 +128,10 @@ def optimise_long_only(
         try:
             prob.solve(solver=cp.SCS, verbose=False)
         except Exception:
-            return OptResult(weights=prev_w / float(prev_w.sum()) if float(prev_w.sum()) > 0 else pd.Series(1.0 / n, index=idx), status="solve_failed")
+            return OptResult(weights=fallback_w, status="solve_failed")
 
     if w.value is None:
-        return OptResult(weights=prev_w / float(prev_w.sum()) if float(prev_w.sum()) > 0 else pd.Series(1.0 / n, index=idx), status="no_solution")
+        return OptResult(weights=fallback_w, status="no_solution")
 
     out = np.array(w.value).reshape(-1)
     out = np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0)
